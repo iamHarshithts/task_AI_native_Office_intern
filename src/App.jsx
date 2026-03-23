@@ -1,24 +1,223 @@
-import { useState, useRef, useCallback, useMemo } from 'react'
+import { useState, useRef, useCallback, useMemo, useEffect } from 'react'
 import './App.css'
 import { createEngine } from './engine/core.js'
 
 const TOTAL_ROWS = 50
 const TOTAL_COLS = 50
 
+// ─────────────────────────────────────────────────────────────
+//  Sort / Filter helpers (view-layer only — engine untouched)
+// ─────────────────────────────────────────────────────────────
+
+/** Compare two cell display values for sorting */
+function compareValues(a, b) {
+  const aNum = parseFloat(a)
+  const bNum = parseFloat(b)
+  const aIsNum = !isNaN(aNum) && a !== ''
+  const bIsNum = !isNaN(bNum) && b !== ''
+
+  if (aIsNum && bIsNum) return aNum - bNum
+  if (aIsNum) return -1   // numbers before strings
+  if (bIsNum) return 1
+  return String(a).localeCompare(String(b))
+}
+
+/** Cycle sort direction: none → asc → desc → none */
+function nextSortDir(current) {
+  if (current === 'none') return 'asc'
+  if (current === 'asc') return 'desc'
+  return 'none'
+}
+
+// ─────────────────────────────────────────────────────────────
+//  FilterDropdown component
+// ─────────────────────────────────────────────────────────────
+
+function FilterDropdown({ colIndex, engine, viewRows, activeFilters, onApply, onClose }) {
+  // Collect unique display values from current viewRows for this column
+  const uniqueValues = useMemo(() => {
+    const seen = new Set()
+    const vals = []
+    for (const rowIndex of viewRows) {
+      const cellData = engine.getCell(rowIndex, colIndex)
+      const display = cellData.error
+        ? cellData.error
+        : (cellData.computed !== null && cellData.computed !== '' ? String(cellData.computed) : cellData.raw)
+      if (!seen.has(display)) {
+        seen.add(display)
+        vals.push(display)
+      }
+    }
+    return vals.sort((a, b) => compareValues(a, b))
+  }, [viewRows, colIndex, engine])
+
+  const existing = activeFilters[colIndex] || new Set(uniqueValues)
+  const [checked, setChecked] = useState(() => new Set(existing))
+  const allChecked = checked.size === uniqueValues.length
+
+  const toggle = (val) => {
+    setChecked(prev => {
+      const next = new Set(prev)
+      next.has(val) ? next.delete(val) : next.add(val)
+      return next
+    })
+  }
+
+  const toggleAll = () => {
+    setChecked(allChecked ? new Set() : new Set(uniqueValues))
+  }
+
+  return (
+    <div className="filter-dropdown" onClick={e => e.stopPropagation()}>
+      <div className="filter-header">
+        <span className="filter-title">Filter</span>
+        <button className="filter-close-btn" onClick={onClose}>✕</button>
+      </div>
+      <div className="filter-search-row">
+        <label className="filter-check-row">
+          <input type="checkbox" checked={allChecked} onChange={toggleAll} />
+          <span>(Select All)</span>
+        </label>
+      </div>
+      <div className="filter-list">
+        {uniqueValues.map(val => (
+          <label key={val} className="filter-check-row">
+            <input
+              type="checkbox"
+              checked={checked.has(val)}
+              onChange={() => toggle(val)}
+            />
+            <span className="filter-val-label">{val === '' ? '(Blank)' : val}</span>
+          </label>
+        ))}
+      </div>
+      <div className="filter-actions">
+        <button className="filter-btn-cancel" onClick={onClose}>Cancel</button>
+        <button
+          className="filter-btn-apply"
+          onClick={() => onApply(colIndex, checked.size === uniqueValues.length ? null : checked)}
+        >
+          OK
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Main App
+// ─────────────────────────────────────────────────────────────
+
 export default function App() {
-  // Engine instance is created once and reused across renders
-  // Note: The engine maintains its own internal state, so React state is only used for UI updates
   const [engine] = useState(() => createEngine(TOTAL_ROWS, TOTAL_COLS))
   const [version, setVersion] = useState(0)
   const [selectedCell, setSelectedCell] = useState(null)
   const [editingCell, setEditingCell] = useState(null)
   const [editValue, setEditValue] = useState('')
-  // Cell styles are stored separately from engine data
-  // Format: { "row,col": { bold: bool, italic: bool, ... } }
   const [cellStyles, setCellStyles] = useState({})
   const cellInputRef = useRef(null)
 
+  // ── Sort state: { col: number, dir: 'asc'|'desc'|'none' }
+  const [sortState, setSortState] = useState({ col: -1, dir: 'none' })
+
+  // ── Filter state: { [colIndex]: Set<string> | null }
+  //    null means "no filter active" (show all); a Set means show only those values
+  const [activeFilters, setActiveFilters] = useState({})
+
+  // ── Which column's filter dropdown is open
+  const [openFilterCol, setOpenFilterCol] = useState(null)
+
+  const filterDropdownRef = useRef(null)
+
   const forceRerender = useCallback(() => setVersion(v => v + 1), [])
+
+  // Close filter dropdown on outside click
+  useEffect(() => {
+    if (openFilterCol === null) return
+    const handler = (e) => {
+      if (filterDropdownRef.current && !filterDropdownRef.current.contains(e.target)) {
+        setOpenFilterCol(null)
+      }
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [openFilterCol])
+
+  // ── View-layer row computation ──────────────────────────────
+  //
+  //  1. Start with ALL physical row indices
+  //  2. Apply filters (hide rows where the filtered col's value isn't in the allowed set)
+  //  3. Apply sort (reorder by the sort column's computed value)
+  //
+  //  The underlying engine rows are NEVER modified. Formulas keep referencing
+  //  their original physical row indices (A1 = row 0, etc.).
+
+  const viewRows = useMemo(() => {
+    // Step 1: all rows
+    let rows = Array.from({ length: engine.rows }, (_, i) => i)
+
+    // Step 2: apply filters
+    for (const [colStr, allowedSet] of Object.entries(activeFilters)) {
+      if (!allowedSet) continue
+      const col = parseInt(colStr)
+      rows = rows.filter(rowIndex => {
+        const cellData = engine.getCell(rowIndex, col)
+        const display = cellData.error
+          ? cellData.error
+          : (cellData.computed !== null && cellData.computed !== '' ? String(cellData.computed) : cellData.raw)
+        return allowedSet.has(display)
+      })
+    }
+
+    // Step 3: apply sort
+    if (sortState.col >= 0 && sortState.dir !== 'none') {
+      const col = sortState.col
+      const dir = sortState.dir
+      rows = [...rows].sort((a, b) => {
+        const aData = engine.getCell(a, col)
+        const bData = engine.getCell(b, col)
+        const aVal = aData.error ? aData.error : (aData.computed !== null && aData.computed !== '' ? String(aData.computed) : aData.raw)
+        const bVal = bData.error ? bData.error : (bData.computed !== null && bData.computed !== '' ? String(bData.computed) : bData.raw)
+        const cmp = compareValues(aVal, bVal)
+        return dir === 'asc' ? cmp : -cmp
+      })
+    }
+
+    return rows
+  }, [engine, version, sortState, activeFilters])
+
+  // ── Sort click ──
+
+  const handleSortClick = useCallback((colIndex) => {
+    setSortState(prev => {
+      if (prev.col === colIndex) {
+        return { col: colIndex, dir: nextSortDir(prev.dir) }
+      }
+      return { col: colIndex, dir: 'asc' }
+    })
+  }, [])
+
+  // ── Filter apply ──
+
+  const handleFilterApply = useCallback((colIndex, allowedSet) => {
+    setActiveFilters(prev => {
+      const next = { ...prev }
+      if (allowedSet === null) {
+        delete next[colIndex]
+      } else {
+        next[colIndex] = allowedSet
+      }
+      return next
+    })
+    setOpenFilterCol(null)
+  }, [])
+
+  const clearAllFilters = useCallback(() => {
+    setActiveFilters({})
+    setSortState({ col: -1, dir: 'none' })
+  }, [])
+
+  const hasAnyFilterOrSort = Object.keys(activeFilters).some(k => activeFilters[k] !== null) || sortState.dir !== 'none'
 
   // ────── Cell style helpers ──────
 
@@ -49,7 +248,6 @@ export default function App() {
   }, [engine])
 
   const commitEdit = useCallback((row, col) => {
-    // Only commit if the value actually changed to avoid unnecessary recalculations
     const currentCell = engine.getCell(row, col)
     if (currentCell.raw !== editValue) {
       engine.setCell(row, col, editValue)
@@ -70,10 +268,13 @@ export default function App() {
   // ────── Keyboard navigation ──────
 
   const handleKeyDown = useCallback((event, row, col) => {
+    // Navigate in view space (sorted/filtered row order)
+    const viewIndex = viewRows.indexOf(row)
     if (event.key === 'Enter') {
       event.preventDefault()
       commitEdit(row, col)
-      startEditing(Math.min(row + 1, engine.rows - 1), col)
+      const nextViewRow = viewRows[Math.min(viewIndex + 1, viewRows.length - 1)]
+      startEditing(nextViewRow, col)
     } else if (event.key === 'Tab') {
       event.preventDefault()
       commitEdit(row, col)
@@ -84,25 +285,27 @@ export default function App() {
     } else if (event.key === 'ArrowDown') {
       event.preventDefault()
       commitEdit(row, col)
-      startEditing(Math.min(row + 1, engine.rows - 1), col)
+      const nextViewRow = viewRows[Math.min(viewIndex + 1, viewRows.length - 1)]
+      startEditing(nextViewRow, col)
     } else if (event.key === 'ArrowUp') {
       event.preventDefault()
       commitEdit(row, col)
-      startEditing(Math.max(row - 1, 0), col)
+      const prevViewRow = viewRows[Math.max(viewIndex - 1, 0)]
+      startEditing(prevViewRow, col)
     } else if (event.key === 'ArrowLeft') {
       event.preventDefault()
       commitEdit(row, col)
       if (col > 0) {
         startEditing(row, col - 1)
-      } else if (row > 0) {
-        startEditing(row - 1, engine.cols - 1)
+      } else if (viewIndex > 0) {
+        startEditing(viewRows[viewIndex - 1], engine.cols - 1)
       }
     } else if (event.key === 'ArrowRight') {
       event.preventDefault()
       commitEdit(row, col)
       startEditing(row, Math.min(col + 1, engine.cols - 1))
     }
-  }, [engine, commitEdit, startEditing])
+  }, [engine, commitEdit, startEditing, viewRows])
 
   // ────── Formula bar handlers ──────
 
@@ -174,9 +377,6 @@ export default function App() {
     if (!selectedCell) return
     engine.setCell(selectedCell.r, selectedCell.c, '')
     forceRerender()
-    // Remove style entry for cleared cell
-    // Note: This deletes the style object entirely - if you need to preserve default styles,
-    // you may want to set them explicitly rather than deleting
     const key = `${selectedCell.r},${selectedCell.c}`
     setCellStyles(prev => { const next = { ...prev }; delete next[key]; return next })
     setEditValue('')
@@ -193,7 +393,8 @@ export default function App() {
     setSelectedCell(null)
     setEditingCell(null)
     setEditValue('')
-  }, [engine, forceRerender])
+    clearAllFilters()
+  }, [engine, forceRerender, clearAllFilters])
 
   // ────── Row / Column operations ──────
 
@@ -250,12 +451,12 @@ export default function App() {
     ? `${getColumnLabel(selectedCell.c)}${selectedCell.r + 1}`
     : 'No cell'
 
-  // Formula bar shows the raw formula text, not the computed value
-  // When editing, show the current editValue; otherwise show the cell's raw content
-  // Note: This is different from the cell display, which shows computed values
   const formulaBarValue = editingCell
     ? editValue
     : (selectedCell ? engine.getCell(selectedCell.r, selectedCell.c).raw : '')
+
+  // Hidden row count indicator
+  const hiddenRowCount = engine.rows - viewRows.length
 
   // ────── Render ──────
 
@@ -331,7 +532,27 @@ export default function App() {
             <button className="toolbar-btn danger" onClick={clearSelectedCell}>✕ Cell</button>
             <button className="toolbar-btn danger" onClick={clearAllCells}>✕ All</button>
           </div>
+
+          {/* ── Sort/Filter clear ── */}
+          {hasAnyFilterOrSort && (
+            <div className="toolbar-group">
+              <button className="toolbar-btn filter-clear-btn" onClick={clearAllFilters} title="Clear all sorts and filters">
+                ⊘ Clear Sort/Filter
+                {hiddenRowCount > 0 && <span className="hidden-badge">{hiddenRowCount} hidden</span>}
+              </button>
+            </div>
+          )}
         </div>
+
+        {/* ── Status bar: filtered row info ── */}
+        {hiddenRowCount > 0 && (
+          <div className="filter-status-bar">
+            <span className="filter-status-icon">🔍</span>
+            Showing <strong>{viewRows.length}</strong> of <strong>{engine.rows}</strong> rows
+            &nbsp;·&nbsp; {hiddenRowCount} row{hiddenRowCount !== 1 ? 's' : ''} hidden by filter
+            <button className="filter-status-clear" onClick={clearAllFilters}>Clear filters</button>
+          </div>
+        )}
 
         {/* ── Formula Bar ── */}
         <div className="formula-bar">
@@ -352,16 +573,65 @@ export default function App() {
             <thead>
               <tr>
                 <th className="col-header-blank"></th>
-                {Array.from({ length: engine.cols }, (_, colIndex) => (
-                  <th key={colIndex} className="col-header">
-                    {getColumnLabel(colIndex)}
-                  </th>
-                ))}
+                {Array.from({ length: engine.cols }, (_, colIndex) => {
+                  const isSorted = sortState.col === colIndex && sortState.dir !== 'none'
+                  const isFiltered = !!activeFilters[colIndex]
+                  const isDropdownOpen = openFilterCol === colIndex
+
+                  return (
+                    <th
+                      key={colIndex}
+                      className={`col-header ${isSorted ? 'col-header-sorted' : ''} ${isFiltered ? 'col-header-filtered' : ''}`}
+                    >
+                      <div className="col-header-inner">
+                        {/* Column letter — click to sort */}
+                        <button
+                          className="col-sort-btn"
+                          onClick={() => handleSortClick(colIndex)}
+                          title={`Sort by column ${getColumnLabel(colIndex)}`}
+                        >
+                          <span className="col-label">{getColumnLabel(colIndex)}</span>
+                          <span className="sort-indicator">
+                            {isSorted
+                              ? (sortState.dir === 'asc' ? '↑' : '↓')
+                              : <span className="sort-indicator-idle">⇅</span>}
+                          </span>
+                        </button>
+
+                        {/* Filter funnel button */}
+                        <div className="filter-btn-wrap" ref={isDropdownOpen ? filterDropdownRef : null}>
+                          <button
+                            className={`col-filter-btn ${isFiltered ? 'col-filter-btn-active' : ''} ${isDropdownOpen ? 'col-filter-btn-open' : ''}`}
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              setOpenFilterCol(isDropdownOpen ? null : colIndex)
+                            }}
+                            title={`Filter column ${getColumnLabel(colIndex)}`}
+                          >
+                            {isFiltered ? '🔽' : '▽'}
+                          </button>
+
+                          {isDropdownOpen && (
+                            <FilterDropdown
+                              colIndex={colIndex}
+                              engine={engine}
+                              viewRows={Array.from({ length: engine.rows }, (_, i) => i)} // always show all values in dropdown
+                              activeFilters={activeFilters}
+                              onApply={handleFilterApply}
+                              onClose={() => setOpenFilterCol(null)}
+                            />
+                          )}
+                        </div>
+                      </div>
+                    </th>
+                  )
+                })}
               </tr>
             </thead>
             <tbody>
-              {Array.from({ length: engine.rows }, (_, rowIndex) => (
-                <tr key={rowIndex}>
+              {viewRows.map((rowIndex) => (
+                <tr key={rowIndex} className="grid-row">
+                  {/* Row number shows original physical row index — makes formula references clear */}
                   <td className="row-header">{rowIndex + 1}</td>
                   {Array.from({ length: engine.cols }, (_, colIndex) => {
                     const isSelected = selectedCell?.r === rowIndex && selectedCell?.c === colIndex
@@ -422,7 +692,7 @@ export default function App() {
         </div>
 
         <p className="footer-hint">
-          Click a cell to edit · Enter/Tab/Arrow keys to navigate · Formulas: =A1+B1 · =SUM(A1:A5) · =AVG(A1:A5) · =MAX(A1:A5) · =MIN(A1:A5)
+          Click column letters to sort (↑ asc → ↓ desc → clear) · Click ▽ to filter · Formulas always reference original cell positions
         </p>
       </div>
     </div>
